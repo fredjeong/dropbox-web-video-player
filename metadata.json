@@ -1,0 +1,5 @@
+{
+  "name": "Dropbox Web Video Player",
+  "description": "A minimal web video player for Dropbox with SRT to VTT subtitle conversion.",
+  "requestFramePermissions": []
+}
