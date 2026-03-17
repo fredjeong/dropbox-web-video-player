@@ -22,6 +22,7 @@ export default function App() {
 
     // Listen for OAuth popup success (no token in message anymore)
     const handleMessage = (event: MessageEvent) => {
+      if (event.origin !== window.location.origin) return;
       if (event.data?.type === 'OAUTH_AUTH_SUCCESS') {
         setIsAuthenticated(true);
       }

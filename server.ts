@@ -5,6 +5,7 @@ import cookieParser from 'cookie-parser';
 import session from 'express-session';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -26,12 +27,23 @@ declare module 'express-session' {
     dropboxAccessToken?: string;
     dropboxRefreshToken?: string;
     tokenExpiresAt?: number;
+    oauthState?: string;
   }
 }
 
 async function startServer() {
   const app = express();
   const PORT = 3000;
+
+  // Clean up expired thumbnails every 5 minutes
+  setInterval(() => {
+    const now = Date.now();
+    for (const [key, value] of thumbnailCache.entries()) {
+      if (now > value.expiresAt) {
+        thumbnailCache.delete(key);
+      }
+    }
+  }, 5 * 60 * 1000);
 
   app.use(cors({ origin: true, credentials: true }));
   app.use(express.json());
@@ -103,19 +115,30 @@ async function startServer() {
   /** Returns the Dropbox OAuth URL */
   app.get('/api/auth/url', (req, res) => {
     const redirectUri = getRedirectUri(req);
-    const params = new URLSearchParams({
-      client_id: process.env.DROPBOX_CLIENT_ID || '',
-      response_type: 'code',
-      redirect_uri: redirectUri,
-      token_access_type: 'offline',  // Request refresh token
+    const state = crypto.randomBytes(16).toString('hex');
+    req.session.oauthState = state;
+    
+    req.session.save(() => {
+      const params = new URLSearchParams({
+        client_id: process.env.DROPBOX_CLIENT_ID || '',
+        response_type: 'code',
+        redirect_uri: redirectUri,
+        token_access_type: 'offline',  // Request refresh token
+        state: state,
+      });
+      res.json({ url: `https://www.dropbox.com/oauth2/authorize?${params.toString()}` });
     });
-    res.json({ url: `https://www.dropbox.com/oauth2/authorize?${params.toString()}` });
   });
 
   /** OAuth callback — stores tokens in server session, never exposes them to the browser */
   app.get('/api/auth/callback', async (req, res) => {
-    const { code } = req.query;
+    const { code, state } = req.query;
     const redirectUri = getRedirectUri(req);
+
+    if (!state || state !== req.session.oauthState) {
+      return res.status(403).send('Invalid state parameter. Possible CSRF attack.');
+    }
+    delete req.session.oauthState;
 
     try {
       const tokenResponse = await fetch('https://api.dropboxapi.com/oauth2/token', {
