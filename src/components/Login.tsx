@@ -6,15 +6,18 @@ interface LoginProps {
 
 export default function Login({ onLogin }: LoginProps) {
   const handleLogin = async () => {
+    const authWindow = window.open('', 'oauth_popup', 'width=600,height=700');
     try {
-      const response = await fetch('/api/auth/url');
+      const response = await fetch('/api/auth/url', { credentials: 'include' });
       const { url } = await response.json();
-      const authWindow = window.open(url, 'oauth_popup', 'width=600,height=700');
-      
       if (!authWindow) {
-        alert('Please allow popups for this site to connect your account.');
+        window.location.href = url;
+        return;
       }
+      authWindow.location.href = url;
+      authWindow.focus();
     } catch (error) {
+      if (authWindow) authWindow.close();
       console.error('Failed to get auth URL', error);
     }
   };
