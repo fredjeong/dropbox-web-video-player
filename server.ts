@@ -31,9 +31,9 @@ declare module 'express-session' {
   }
 }
 
-async function startServer() {
+// ─── Startup ───────────────────────────────────────────────────────────────────
+async function createExpressApp() {
   const app = express();
-  const PORT = 3000;
 
   // Clean up expired thumbnails every 5 minutes
   setInterval(() => {
@@ -62,7 +62,7 @@ async function startServer() {
     },
   }));
 
-  // ─── Helpers ──────────────────────────────────────────────────────────────
+  // Helper inside for access to app state if needed
   const getRedirectUri = (req: express.Request) => {
     if (process.env.APP_URL) {
       return `${process.env.APP_URL.replace(/\/$/, '')}/api/auth/callback`;
@@ -72,8 +72,7 @@ async function startServer() {
     return `${protocol}://${host}/api/auth/callback`;
   };
 
-  const requireAuth = async (req: express.Request, res: express.Response): Promise<string | null> => {
-    // Try to refresh token if expired
+  const requireAuth = async (req: express.Request, _res: express.Response): Promise<string | null> => {
     if (req.session.tokenExpiresAt && Date.now() > req.session.tokenExpiresAt - 60_000) {
       if (req.session.dropboxRefreshToken) {
         const refreshed = await refreshAccessToken(req.session.dropboxRefreshToken);
@@ -81,12 +80,8 @@ async function startServer() {
           req.session.dropboxAccessToken = refreshed.access_token;
           req.session.tokenExpiresAt = Date.now() + (refreshed.expires_in ?? 14400) * 1000;
           await new Promise<void>((resolve) => req.session.save(() => resolve()));
-        } else {
-          return null;
-        }
-      } else {
-        return null;
-      }
+        } else return null;
+      } else return null;
     }
     return req.session.dropboxAccessToken ?? null;
   };
@@ -99,47 +94,35 @@ async function startServer() {
           'Content-Type': 'application/x-www-form-urlencoded',
           Authorization: `Basic ${Buffer.from(`${process.env.DROPBOX_CLIENT_ID}:${process.env.DROPBOX_CLIENT_SECRET}`).toString('base64')}`,
         },
-        body: new URLSearchParams({
-          grant_type: 'refresh_token',
-          refresh_token: refreshToken,
-        }),
+        body: new URLSearchParams({ grant_type: 'refresh_token', refresh_token: refreshToken }),
       });
       const data = await res.json() as DropboxTokenData;
       return data.access_token ? data : null;
-    } catch {
-      return null;
-    }
+    } catch { return null; }
   };
 
   // ─── Auth Routes ──────────────────────────────────────────────────────────
-  /** Returns the Dropbox OAuth URL */
   app.get('/api/auth/url', (req, res) => {
     const redirectUri = getRedirectUri(req);
     const state = crypto.randomBytes(16).toString('hex');
     req.session.oauthState = state;
-    
     req.session.save(() => {
       const params = new URLSearchParams({
         client_id: process.env.DROPBOX_CLIENT_ID || '',
         response_type: 'code',
         redirect_uri: redirectUri,
-        token_access_type: 'offline',  // Request refresh token
+        token_access_type: 'offline',
         state: state,
       });
       res.json({ url: `https://www.dropbox.com/oauth2/authorize?${params.toString()}` });
     });
   });
 
-  /** OAuth callback — stores tokens in server session, never exposes them to the browser */
   app.get('/api/auth/callback', async (req, res) => {
     const { code, state } = req.query;
     const redirectUri = getRedirectUri(req);
-
-    if (!state || state !== req.session.oauthState) {
-      return res.status(403).send('Invalid state parameter. Possible CSRF attack.');
-    }
+    if (!state || state !== req.session.oauthState) return res.status(403).send('Invalid state');
     delete req.session.oauthState;
-
     try {
       const tokenResponse = await fetch('https://api.dropboxapi.com/oauth2/token', {
         method: 'POST',
@@ -153,46 +136,22 @@ async function startServer() {
           redirect_uri: redirectUri,
         }),
       });
-
       const data = await tokenResponse.json() as DropboxTokenData;
       if (data.access_token) {
         req.session.dropboxAccessToken = data.access_token;
         req.session.dropboxRefreshToken = data.refresh_token;
-        req.session.tokenExpiresAt = data.expires_in
-          ? Date.now() + data.expires_in * 1000
-          : undefined;
-
+        req.session.tokenExpiresAt = data.expires_in ? Date.now() + data.expires_in * 1000 : undefined;
         await new Promise<void>((resolve) => req.session.save(() => resolve()));
-
-        // Close popup and signal success — no token in JS context
-        res.send(`
-          <html><body><script>
-            if (window.opener) {
-              window.opener.postMessage(
-                { type: 'OAUTH_AUTH_SUCCESS' },
-                ${JSON.stringify(getRedirectUri(req).replace('/api/auth/callback', ''))});
-              window.close();
-            } else {
-              window.location.href = '/';
-            }
-          </script><p>Authentication successful. This window should close automatically.</p></body></html>
-        `);
-      } else {
-        res.status(400).send('Failed to get token from Dropbox.');
-      }
-    } catch (error) {
-      console.error('Auth callback error:', error);
-      res.status(500).send('Error during authentication');
-    }
+        res.send(`<html><body><script>if(window.opener){window.opener.postMessage({type:'OAUTH_AUTH_SUCCESS'}, ${JSON.stringify(getRedirectUri(req).replace('/api/auth/callback',''))});window.close();}else{window.location.href='/';}</script></body></html>`);
+      } else res.status(400).send('Failed to get token');
+    } catch { res.status(500).send('Error'); }
   });
 
-  /** Check auth status — lets the frontend know if a session is active */
   app.get('/api/auth/status', async (req, res) => {
     const token = await requireAuth(req, res);
     res.json({ authenticated: !!token });
   });
 
-  /** Logout — destroy session */
   app.post('/api/auth/logout', (req, res) => {
     req.session.destroy(() => {
       res.clearCookie('connect.sid');
@@ -200,262 +159,138 @@ async function startServer() {
     });
   });
 
-  // ─── Video Routes ─────────────────────────────────────────────────────────
-  /**
-   * Fetch all valid video items via smart folder filtering:
-   * Lists folders recursively. A folder is "valid" if it contains exactly 1 video file.
-   * Returns folder-name as title, plus subtitle files found alongside the video.
-   */
+  // ─── Video API Routes ─────────────────────────────────────────────────────
   app.get('/api/videos', async (req, res) => {
     const token = await requireAuth(req, res);
     if (!token) return res.status(401).json({ error: 'Unauthorized' });
-
     const rootPath = (req.query.path as string) || '';
     const VIDEO_EXTENSIONS = new Set(['mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v']);
     const SUBTITLE_EXTENSIONS = new Set(['srt', 'vtt', 'ass', 'ssa']);
-
     try {
-      // Collect all files recursively using list_folder
-      type DropboxFileEntry = {
-        '.tag': 'file' | 'folder';
-        id: string;
-        name: string;
-        path_display: string;
-        path_lower: string;
-        client_modified: string;
-      };
-
+      type DropboxFileEntry = { '.tag': 'file' | 'folder'; id: string; name: string; path_display: string; client_modified: string; };
       const allFiles: DropboxFileEntry[] = [];
       let cursor: string | null = null;
       let hasMore = true;
-
       while (hasMore) {
-        let data: any;
-        if (!cursor) {
-          const response = await fetch('https://api.dropboxapi.com/2/files/list_folder', {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${token}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-              path: rootPath,
-              recursive: true,
-              include_media_info: false,
-              include_deleted: false,
-            }),
-          });
-          data = await response.json();
-        } else {
-          const response = await fetch('https://api.dropboxapi.com/2/files/list_folder/continue', {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${token}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ cursor }),
-          });
-          data = await response.json();
-        }
-
-        if (data.error_summary) {
-          console.error('Dropbox API error:', data.error_summary);
-          break;
-        }
-
-        for (const entry of (data.entries || []) as DropboxFileEntry[]) {
-          if (entry['.tag'] === 'file') {
-            allFiles.push(entry);
-          }
-        }
-
-        hasMore = data.has_more ?? false;
-        cursor = data.cursor ?? null;
+        const response = await fetch(`https://api.dropboxapi.com/2/files/list_folder${cursor ? '/continue' : ''}`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify(cursor ? { cursor } : { path: rootPath, recursive: true }),
+        });
+        const data: any = await response.json();
+        if (data.error_summary) break;
+        for (const entry of (data.entries || [])) if (entry['.tag'] === 'file') allFiles.push(entry);
+        hasMore = data.has_more ?? false; cursor = data.cursor ?? null;
       }
-
-      // Group files by parent folder
       const byFolder = new Map<string, DropboxFileEntry[]>();
       for (const file of allFiles) {
         const folderPath = file.path_display.substring(0, file.path_display.lastIndexOf('/'));
         if (!byFolder.has(folderPath)) byFolder.set(folderPath, []);
         byFolder.get(folderPath)!.push(file);
       }
-
-      // Filter: only folders with exactly 1 video file
       const videos = [];
       for (const [folderPath, files] of byFolder.entries()) {
-        const videoFiles = files.filter(f => {
-          const ext = f.name.split('.').pop()?.toLowerCase() ?? '';
-          return VIDEO_EXTENSIONS.has(ext);
-        });
+        const videoFiles = files.filter(f => VIDEO_EXTENSIONS.has(f.name.split('.').pop()?.toLowerCase() ?? ''));
         if (videoFiles.length !== 1) continue;
-
         const videoFile = videoFiles[0];
-        const videoBaseName = videoFile.name.replace(/\.[^.]+$/, ''); // strip extension
-
-        // Find subtitle files with matching base name
-        const subtitleFiles = files.filter(f => {
-          const ext = f.name.split('.').pop()?.toLowerCase() ?? '';
-          return SUBTITLE_EXTENSIONS.has(ext) && f.name.startsWith(videoBaseName);
-        });
-
+        const videoBaseName = videoFile.name.replace(/\.[^.]+$/, '');
+        const subtitleFiles = files.filter(f => SUBTITLE_EXTENSIONS.has(f.name.split('.').pop()?.toLowerCase() ?? '') && f.name.startsWith(videoBaseName));
         const folderName = folderPath.split('/').filter(Boolean).pop() || videoFile.name;
-
         videos.push({
-          id: videoFile.id,
-          title: folderName,
-          path: videoFile.path_display,
-          addedAt: videoFile.client_modified,
+          id: videoFile.id, title: folderName, path: videoFile.path_display, addedAt: videoFile.client_modified,
           thumbnailUrl: `/api/videos/thumbnail?path=${encodeURIComponent(videoFile.path_display)}`,
-          videoUrl: '',
-          subtitles: subtitleFiles.map(sf => {
+          videoUrl: '', subtitles: subtitleFiles.map(sf => {
             const ext = sf.name.split('.').pop()?.toLowerCase() ?? '';
-            // Derive language from filename, e.g. "movie.ko.srt" → "ko"
             const parts = sf.name.replace(/\.[^.]+$/, '').split('.');
             const lang = parts.length > 1 ? parts[parts.length - 1] : 'und';
-            const langLabels: Record<string, string> = {
-              ko: '한국어', en: 'English', zh: '中文', ja: '日本語',
-              fr: 'Français', es: 'Español', de: 'Deutsch',
-            };
-            return {
-              id: sf.id,
-              language: lang,
-              label: langLabels[lang] ?? lang.toUpperCase(),
-              path: sf.path_display,
-              format: ext,
-            };
+            const langLabels: Record<string, string> = { ko: '한국어', en: 'English', zh: '中文', ja: '日本語' };
+            return { id: sf.id, language: lang, label: langLabels[lang] ?? lang.toUpperCase(), path: sf.path_display, format: ext };
           }),
         });
       }
-
       res.json(videos);
-    } catch (error) {
-      console.error('Failed to fetch videos:', error);
-      res.status(500).json({ error: 'Failed to fetch videos' });
-    }
+    } catch { res.status(500).json({ error: 'Failed' }); }
   });
 
-  /** Proxy Dropbox thumbnail (with in-memory cache) */
   app.get('/api/videos/thumbnail', async (req, res) => {
     const token = await requireAuth(req, res);
     if (!token) return res.status(401).send('Unauthorized');
     const filePath = req.query.path as string;
-
-    // Check cache
     const cached = thumbnailCache.get(filePath);
     if (cached && Date.now() < cached.expiresAt) {
       res.setHeader('Content-Type', cached.contentType);
       res.setHeader('Cache-Control', 'public, max-age=1800');
       return res.send(cached.data);
     }
-
     try {
       const response = await fetch('https://content.dropboxapi.com/2/files/get_thumbnail_v2', {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Dropbox-API-Arg': JSON.stringify({
-            resource: { '.tag': 'path', path: filePath },
-            format: 'jpeg',
-            size: 'w480h320',
-          }),
-        },
+        headers: { 'Authorization': `Bearer ${token}`, 'Dropbox-API-Arg': JSON.stringify({ resource: { '.tag': 'path', path: filePath }, format: 'jpeg', size: 'w480h320' }) },
       });
-
-      if (!response.ok) {
-        return res.redirect('https://picsum.photos/seed/video/480/320');
-      }
-
+      if (!response.ok) return res.redirect('https://picsum.photos/480/320');
       const contentType = response.headers.get('content-type') || 'image/jpeg';
-      const arrayBuffer = await response.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-
-      // Store in cache
+      const buffer = Buffer.from(await response.arrayBuffer());
       thumbnailCache.set(filePath, { data: buffer, contentType, expiresAt: Date.now() + THUMBNAIL_TTL_MS });
-
       res.setHeader('Content-Type', contentType);
       res.setHeader('Cache-Control', 'public, max-age=1800');
       res.send(buffer);
-    } catch (error) {
-      res.redirect('https://picsum.photos/seed/video/480/320');
-    }
+    } catch { res.redirect('https://picsum.photos/480/320'); }
   });
 
-  /** Get a temporary streaming link for a video */
   app.get('/api/videos/stream', async (req, res) => {
     const token = await requireAuth(req, res);
     if (!token) return res.status(401).json({ error: 'Unauthorized' });
     const filePath = req.query.path as string;
-    if (!filePath) return res.status(400).json({ error: 'Missing path' });
-
     try {
       const response = await fetch('https://api.dropboxapi.com/2/files/get_temporary_link', {
         method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
         body: JSON.stringify({ path: filePath }),
       });
       const data = await response.json();
-
-      if (data.link) {
-        res.json({ url: data.link });
-      } else {
-        res.status(404).json({ error: 'Link not found' });
-      }
-    } catch (error) {
-      res.status(500).json({ error: 'Failed to get stream link' });
-    }
+      if (data.link) res.json({ url: data.link }); else res.status(404).json({ error: 'Not found' });
+    } catch { res.status(500).json({ error: 'Failed' }); }
   });
 
-  /** Download and return a subtitle file's content */
   app.get('/api/subtitles', async (req, res) => {
     const token = await requireAuth(req, res);
     if (!token) return res.status(401).json({ error: 'Unauthorized' });
     const filePath = req.query.path as string;
-    if (!filePath) return res.status(400).json({ error: 'Missing path' });
-
     try {
       const response = await fetch('https://content.dropboxapi.com/2/files/download', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Dropbox-API-Arg': JSON.stringify({ path: filePath }),
-        },
+        method: 'POST', headers: { 'Authorization': `Bearer ${token}`, 'Dropbox-API-Arg': JSON.stringify({ path: filePath }) },
       });
-
-      if (!response.ok) {
-        return res.status(404).json({ error: 'Subtitle file not found' });
-      }
-
-      const text = await response.text();
+      if (!response.ok) return res.status(404).send('Not found');
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      res.send(text);
-    } catch (error) {
-      console.error('Failed to fetch subtitle:', error);
-      res.status(500).json({ error: 'Failed to fetch subtitle' });
-    }
+      res.send(await response.text());
+    } catch { res.status(500).send('Error'); }
   });
 
-  // ─── Vite / Static ────────────────────────────────────────────────────────
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
+  // ─── Vite Middleware (Development Only) ──────────────────────────────────
+  if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   } else {
+    // Vercel handles static files via vercel.json, but for traditional VPS:
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+  return app;
+}
+
+// Export for Vercel
+const appPromise = createExpressApp();
+export default async (req: express.Request, res: express.Response) => {
+  const app = await appPromise;
+  app(req, res);
+};
+
+// Local only start
+if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+  appPromise.then(app => {
+    const PORT = 3000;
+    app.listen(PORT, '0.0.0.0', () => console.log(`Server running on http://localhost:${PORT}`));
   });
 }
 
-startServer();
