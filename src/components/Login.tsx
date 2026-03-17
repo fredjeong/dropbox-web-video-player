@@ -1,15 +1,31 @@
 import { LogIn } from 'lucide-react';
+import { useState } from 'react';
 
 interface LoginProps {
   onLogin: () => void;
 }
 
 export default function Login({ onLogin }: LoginProps) {
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
   const handleLogin = async () => {
+    setErrorMessage(null);
     const authWindow = window.open('', 'oauth_popup', 'width=600,height=700');
+    if (authWindow) {
+      authWindow.document.title = 'Connecting to Dropbox';
+      authWindow.document.body.innerHTML = '<p style="font-family: system-ui; padding: 16px;">Connecting to Dropbox...</p>';
+    }
     try {
       const response = await fetch('/api/auth/url', { credentials: 'include' });
-      const { url } = await response.json();
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`Auth URL request failed (${response.status}): ${text.slice(0, 200)}`);
+      }
+      const data = await response.json() as { url?: string };
+      const url = data.url;
+      if (!url) {
+        throw new Error('Auth URL response missing "url"');
+      }
       if (!authWindow) {
         window.location.href = url;
         return;
@@ -17,7 +33,10 @@ export default function Login({ onLogin }: LoginProps) {
       authWindow.location.href = url;
       authWindow.focus();
     } catch (error) {
-      if (authWindow) authWindow.close();
+      if (authWindow && !authWindow.closed) {
+        authWindow.document.body.innerHTML = '<p style="font-family: system-ui; padding: 16px; color: #b91c1c;">Failed to start Dropbox login. Please try again or check server logs.</p>';
+      }
+      setErrorMessage('로그인 링크를 가져오지 못했습니다. Vercel 함수 로그에서 /api/auth/url 오류를 확인해주세요.');
       console.error('Failed to get auth URL', error);
     }
   };
@@ -38,6 +57,11 @@ export default function Login({ onLogin }: LoginProps) {
         >
           Dropbox로 계속하기
         </button>
+        {errorMessage && (
+          <p className="mt-3 text-[11px] sm:text-sm text-red-400">
+            {errorMessage}
+          </p>
+        )}
       </div>
     </div>
   );
